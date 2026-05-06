@@ -1,0 +1,146 @@
+name: Repo Feasibility Spoke
+
+on:
+  repository_dispatch:
+    types: [jira_feature_request]
+  workflow_dispatch:
+    inputs:
+      analysis_id:
+        description: analysis correlation id
+        required: true
+      jira_issue_key:
+        description: Jira issue key
+        required: true
+      jira_summary:
+        description: Jira summary
+        required: true
+      jira_description:
+        description: Jira description
+        required: true
+      jira_priority:
+        description: Jira priority
+        required: false
+        default: Medium
+      jira_labels:
+        description: Jira labels
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  # Keep true for integration testing without model APIs
+  USE_SIMULATED_OUTPUT: "true"
+  TOP_FILE_LIMIT: "15"
+  MAX_FILE_CHARS: "10000"
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve payload
+        id: payload
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "analysis_id=${{ github.event.client_payload.analysis_id }}" >> "$GITHUB_OUTPUT"
+            echo "jira_issue_key=${{ github.event.client_payload.jira_issue_key }}" >> "$GITHUB_OUTPUT"
+            echo "jira_summary<<EOF" >> "$GITHUB_OUTPUT"
+            echo "${{ github.event.client_payload.jira_summary }}" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+            echo "jira_description<<EOF" >> "$GITHUB_OUTPUT"
+            echo "${{ github.event.client_payload.jira_description }}" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+            echo "jira_priority=${{ github.event.client_payload.jira_priority }}" >> "$GITHUB_OUTPUT"
+            echo "jira_labels=${{ github.event.client_payload.jira_labels }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "analysis_id=${{ inputs.analysis_id }}" >> "$GITHUB_OUTPUT"
+            echo "jira_issue_key=${{ inputs.jira_issue_key }}" >> "$GITHUB_OUTPUT"
+            echo "jira_summary<<EOF" >> "$GITHUB_OUTPUT"
+            echo "${{ inputs.jira_summary }}" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+            echo "jira_description<<EOF" >> "$GITHUB_OUTPUT"
+            echo "${{ inputs.jira_description }}" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+            echo "jira_priority=${{ inputs.jira_priority }}" >> "$GITHUB_OUTPUT"
+            echo "jira_labels=${{ inputs.jira_labels }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build repo context summary
+        run: |
+          mkdir -p out
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          query = f"{os.environ['JIRA_SUMMARY']} {os.environ['JIRA_DESCRIPTION']} {os.environ['JIRA_LABELS']}".lower()
+          keywords = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{3,}", query)
+          files = subprocess.run(["git", "ls-files"], capture_output=True, text=True, check=True).stdout.splitlines()
+          snippets = []
+          for rel in files[:100]:
+              p = Path(rel)
+              if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".zip", ".pdf"}:
+                  continue
+              try:
+                  txt = p.read_text(encoding="utf-8", errors="ignore")
+              except Exception:
+                  continue
+              if not txt.strip():
+                  continue
+              sample = txt[:int(os.environ["MAX_FILE_CHARS"])]
+              score = sum((rel.lower() + "\n" + sample.lower()).count(k) for k in keywords) if keywords else 0
+              snippets.append((score, rel, sample))
+          snippets.sort(key=lambda x: x[0], reverse=True)
+          selected = snippets[:int(os.environ["TOP_FILE_LIMIT"])]
+          Path("out/context.json").write_text(
+              json.dumps(
+                  [{"path": r, "score": s, "snippet": t} for s, r, t in selected],
+                  ensure_ascii=True,
+                  indent=2
+              ),
+              encoding="utf-8"
+          )
+          PY
+        env:
+          JIRA_SUMMARY: ${{ steps.payload.outputs.jira_summary }}
+          JIRA_DESCRIPTION: ${{ steps.payload.outputs.jira_description }}
+          JIRA_LABELS: ${{ steps.payload.outputs.jira_labels }}
+
+      - name: Produce standardized repo assessment (simulation)
+        if: ${{ env.USE_SIMULATED_OUTPUT == 'true' }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          repo = os.environ["GITHUB_REPOSITORY"]
+          out = {
+              "analysis_id": os.environ["ANALYSIS_ID"],
+              "repo_name": repo,
+              "repo_status": "success",
+              "repo_verdict": "partially_feasible",
+              "affected_components": ["api", "ui"],
+              "effort_estimate": {"size": "M", "rationale": "Requires moderate changes in this repository."},
+              "risks": [
+                  {"severity": "medium", "type": "technical", "detail": "Feature touches multiple modules in this repo."}
+              ],
+              "open_questions": [
+                  "Should this repo own the new contract or consume from a shared package?"
+              ],
+              "confidence_score": 80
+          }
+          open("out/repo-assessment.json", "w", encoding="utf-8").write(json.dumps(out, ensure_ascii=True, indent=2))
+          PY
+        env:
+          ANALYSIS_ID: ${{ steps.payload.outputs.analysis_id }}
+
+      - name: Upload spoke artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: assessment-${{ steps.payload.outputs.analysis_id }}-${{ github.event.repository.name }}
+          path: out/repo-assessment.json
