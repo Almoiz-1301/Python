@@ -1,4 +1,5 @@
 name: Repo Feasibility Spoke
+run-name: spoke-${{ github.event.client_payload.analysis_id || inputs.analysis_id || github.run_id }}-${{ github.repository }}
 
 on:
   repository_dispatch:
@@ -30,10 +31,11 @@ permissions:
   contents: read
 
 env:
-  # Keep true for integration testing without model APIs
-  USE_SIMULATED_OUTPUT: "true"
-  TOP_FILE_LIMIT: "15"
-  MAX_FILE_CHARS: "10000"
+  TOP_FILE_LIMIT: "20"
+  MAX_FILE_CHARS: "12000"
+  CHUNK_LINES: "180"
+  CHUNK_OVERLAP: "40"
+  CHUNKS_PER_FILE: "2"
 
 jobs:
   analyze:
@@ -69,7 +71,7 @@ jobs:
             echo "jira_labels=${{ inputs.jira_labels }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build repo context summary
+      - name: Build repo context with targeted chunks
         run: |
           mkdir -p out
           python3 - <<'PY'
@@ -79,13 +81,27 @@ jobs:
           import subprocess
           from pathlib import Path
 
+          top_limit = int(os.environ.get("TOP_FILE_LIMIT", "20"))
+          max_chars = int(os.environ.get("MAX_FILE_CHARS", "12000"))
+          chunk_lines = int(os.environ.get("CHUNK_LINES", "180"))
+          chunk_overlap = int(os.environ.get("CHUNK_OVERLAP", "40"))
+          chunks_per_file = int(os.environ.get("CHUNKS_PER_FILE", "2"))
+
           query = f"{os.environ['JIRA_SUMMARY']} {os.environ['JIRA_DESCRIPTION']} {os.environ['JIRA_LABELS']}".lower()
-          keywords = re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{3,}", query)
+          keywords = set(re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{3,}", query))
+          stop = {"with", "from", "that", "this", "have", "will", "should", "into", "about", "feature", "request"}
+          keywords = [k for k in keywords if k not in stop]
+
+          excluded_parts = {".git", "node_modules", "vendor", "dist", "build", "__pycache__", ".next", ".cache", "coverage"}
+          excluded_suffixes = {".png", ".jpg", ".jpeg", ".gif", ".zip", ".pdf", ".gz", ".jar", ".exe", ".dll", ".so", ".lock", ".min.js"}
+
           files = subprocess.run(["git", "ls-files"], capture_output=True, text=True, check=True).stdout.splitlines()
-          snippets = []
-          for rel in files[:100]:
+          file_candidates = []
+          for rel in files:
               p = Path(rel)
-              if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".zip", ".pdf"}:
+              if any(part in excluded_parts for part in p.parts):
+                  continue
+              if p.suffix.lower() in excluded_suffixes:
                   continue
               try:
                   txt = p.read_text(encoding="utf-8", errors="ignore")
@@ -93,51 +109,135 @@ jobs:
                   continue
               if not txt.strip():
                   continue
-              sample = txt[:int(os.environ["MAX_FILE_CHARS"])]
+              sample = txt[:max_chars]
               score = sum((rel.lower() + "\n" + sample.lower()).count(k) for k in keywords) if keywords else 0
-              snippets.append((score, rel, sample))
-          snippets.sort(key=lambda x: x[0], reverse=True)
-          selected = snippets[:int(os.environ["TOP_FILE_LIMIT"])]
-          Path("out/context.json").write_text(
-              json.dumps(
-                  [{"path": r, "score": s, "snippet": t} for s, r, t in selected],
-                  ensure_ascii=True,
-                  indent=2
-              ),
-              encoding="utf-8"
-          )
+              file_candidates.append((score, rel, txt))
+
+          file_candidates.sort(key=lambda x: x[0], reverse=True)
+          selected_files = file_candidates[:top_limit]
+          context = []
+
+          for file_score, rel, txt in selected_files:
+              lines = txt.splitlines()
+              step = max(1, chunk_lines - chunk_overlap)
+              chunk_candidates = []
+              for start in range(0, len(lines), step):
+                  end = min(len(lines), start + chunk_lines)
+                  chunk_txt = "\n".join(lines[start:end])
+                  if not chunk_txt.strip():
+                      continue
+                  chunk_score = sum((rel.lower() + "\n" + chunk_txt.lower()).count(k) for k in keywords) if keywords else 0
+                  total = file_score + chunk_score
+                  chunk_candidates.append((total, start + 1, end, chunk_txt[:max_chars]))
+                  if end >= len(lines):
+                      break
+              chunk_candidates.sort(key=lambda x: x[0], reverse=True)
+              for total, start_line, end_line, chunk in chunk_candidates[:chunks_per_file]:
+                  context.append({
+                      "path": rel,
+                      "file_score": file_score,
+                      "chunk_score": total,
+                      "start_line": start_line,
+                      "end_line": end_line,
+                      "snippet": chunk
+                  })
+
+          Path("out/context.json").write_text(json.dumps(context, ensure_ascii=True, indent=2), encoding="utf-8")
           PY
         env:
           JIRA_SUMMARY: ${{ steps.payload.outputs.jira_summary }}
           JIRA_DESCRIPTION: ${{ steps.payload.outputs.jira_description }}
           JIRA_LABELS: ${{ steps.payload.outputs.jira_labels }}
 
-      - name: Produce standardized repo assessment (simulation)
-        if: ${{ env.USE_SIMULATED_OUTPUT == 'true' }}
+      - name: Produce standardized repo assessment (heuristic, no AI)
         run: |
           python3 - <<'PY'
           import json
           import os
+          from pathlib import Path
+
+          analysis_id = os.environ["ANALYSIS_ID"]
           repo = os.environ["GITHUB_REPOSITORY"]
-          out = {
-              "analysis_id": os.environ["ANALYSIS_ID"],
-              "repo_name": repo,
-              "repo_status": "success",
-              "repo_verdict": "partially_feasible",
-              "affected_components": ["api", "ui"],
-              "effort_estimate": {"size": "M", "rationale": "Requires moderate changes in this repository."},
-              "risks": [
-                  {"severity": "medium", "type": "technical", "detail": "Feature touches multiple modules in this repo."}
-              ],
-              "open_questions": [
-                  "Should this repo own the new contract or consume from a shared package?"
-              ],
-              "confidence_score": 80
-          }
-          open("out/repo-assessment.json", "w", encoding="utf-8").write(json.dumps(out, ensure_ascii=True, indent=2))
+          summary = os.environ["JIRA_SUMMARY"].strip()
+          description = os.environ["JIRA_DESCRIPTION"].strip()
+
+          try:
+              chunks = json.loads(Path("out/context.json").read_text(encoding="utf-8"))
+              top_chunks = sorted(chunks, key=lambda x: x.get("chunk_score", 0), reverse=True)[:8]
+              components = []
+              for item in top_chunks:
+                  path = item.get("path", "")
+                  root = path.split("/")[0] if "/" in path else path
+                  if root and root not in components:
+                      components.append(root)
+              if not components:
+                  components = ["core"]
+
+              max_score = max([c.get("chunk_score", 0) for c in top_chunks], default=0)
+              if max_score >= 25:
+                  effort = "L"
+              elif max_score >= 10:
+                  effort = "M"
+              else:
+                  effort = "S"
+
+              verdict = "feasible" if max_score < 35 else "partially_feasible"
+              confidence = min(90, 55 + max_score)
+
+              out = {
+                  "analysis_id": analysis_id,
+                  "repo_name": repo,
+                  "repo_status": "success",
+                  "repo_verdict": verdict,
+                  "affected_components": components[:6],
+                  "effort_estimate": {
+                      "size": effort,
+                      "rationale": f"Based on {len(top_chunks)} relevant chunks and max relevance score {max_score}."
+                  },
+                  "risks": [
+                      {
+                          "severity": "medium" if effort in ("S", "M") else "high",
+                          "type": "technical",
+                          "detail": "Multiple relevant files indicate cross-module updates may be required."
+                      }
+                  ],
+                  "open_questions": [
+                      "Is this repository the source of truth for the requested behavior?",
+                      "Do changes here require coordinated updates in other repositories?"
+                  ],
+                  "confidence_score": int(confidence),
+                  "evidence": [
+                      {
+                          "path": c.get("path"),
+                          "start_line": c.get("start_line"),
+                          "end_line": c.get("end_line"),
+                          "chunk_score": c.get("chunk_score")
+                      } for c in top_chunks[:5]
+                  ],
+                  "request_excerpt": {
+                      "summary": summary[:200],
+                      "description": description[:400]
+                  }
+              }
+          except Exception as e:
+              out = {
+                  "analysis_id": analysis_id,
+                  "repo_name": repo,
+                  "repo_status": "failed",
+                  "repo_verdict": "partially_feasible",
+                  "affected_components": [],
+                  "effort_estimate": {"size": "L", "rationale": "Assessment generation failed; manual review required."},
+                  "risks": [{"severity": "high", "type": "technical", "detail": f"Spoke assessment failed: {e}"}],
+                  "open_questions": ["Can this repository assessment be retried with healthy context generation?"],
+                  "confidence_score": 30
+              }
+
+          Path("out/repo-assessment.json").write_text(json.dumps(out, ensure_ascii=True, indent=2), encoding="utf-8")
           PY
         env:
           ANALYSIS_ID: ${{ steps.payload.outputs.analysis_id }}
+          JIRA_SUMMARY: ${{ steps.payload.outputs.jira_summary }}
+          JIRA_DESCRIPTION: ${{ steps.payload.outputs.jira_description }}
 
       - name: Upload spoke artifact
         uses: actions/upload-artifact@v4
