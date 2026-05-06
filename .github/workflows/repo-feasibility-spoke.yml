@@ -31,6 +31,7 @@ permissions:
   contents: read
 
 env:
+  USE_GREPTILE: "true"
   TOP_FILE_LIMIT: "20"
   MAX_FILE_CHARS: "12000"
   CHUNK_LINES: "180"
@@ -71,7 +72,156 @@ jobs:
             echo "jira_labels=${{ inputs.jira_labels }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Try Greptile context retrieval
+        id: greptile
+        run: |
+          mkdir -p out
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          use_greptile = os.environ.get("USE_GREPTILE", "false").lower() == "true"
+          api_key = os.environ.get("GREPTILE_API_KEY", "").strip()
+          context_url = os.environ.get("GREPTILE_CONTEXT_URL", "").strip()
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          branch = os.environ.get("GITHUB_REF_NAME", "main")
+          analysis_id = os.environ.get("ANALYSIS_ID", "unknown-analysis")
+          query = f"{os.environ.get('JIRA_SUMMARY','')} {os.environ.get('JIRA_DESCRIPTION','')} {os.environ.get('JIRA_LABELS','')}".strip()
+
+          def set_output(name, value):
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+                  f.write(f"{name}={value}\n")
+
+          if not use_greptile:
+              print("Greptile disabled via USE_GREPTILE")
+              set_output("used", "false")
+              set_output("source", "local_chunks")
+              raise SystemExit(0)
+
+          if not api_key:
+              print("GREPTILE_API_KEY missing; falling back to local chunks")
+              set_output("used", "false")
+              set_output("source", "local_chunks")
+              raise SystemExit(0)
+
+          if not context_url:
+              context_url = "https://api.greptile.com/v2/query"
+              print(f"GREPTILE_CONTEXT_URL missing; defaulting to {context_url}")
+
+          payload = {
+              "messages": [
+                  {
+                      "id": analysis_id,
+                      "content": query,
+                      "role": "user"
+                  }
+              ],
+              "repositories": [
+                  {
+                      "remote": "github",
+                      "repository": repo,
+                      "branch": branch
+                  }
+              ],
+              "sessionId": analysis_id,
+              "stream": False,
+              "genius": True
+          }
+
+          req = urllib.request.Request(
+              context_url,
+              data=json.dumps(payload).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json",
+                  "Accept": "application/json",
+              },
+              method="POST",
+          )
+
+          try:
+              with urllib.request.urlopen(req, timeout=40) as resp:
+                  response = json.loads(resp.read().decode("utf-8"))
+          except urllib.error.HTTPError as e:
+              body = ""
+              try:
+                  body = e.read().decode("utf-8", errors="ignore")
+              except Exception:
+                  pass
+              print(f"Greptile request failed with HTTP {e.code}: {body[:500]}")
+              set_output("used", "false")
+              set_output("source", "local_chunks")
+              raise SystemExit(0)
+          except Exception as e:
+              print(f"Greptile request failed: {e}")
+              set_output("used", "false")
+              set_output("source", "local_chunks")
+              raise SystemExit(0)
+
+          if isinstance(response, dict):
+              keys = sorted(response.keys())
+              print(f"Greptile response keys: {keys}")
+              for key in ("snippets", "results", "hits", "data"):
+                  val = response.get(key)
+                  if isinstance(val, list):
+                      print(f"Greptile list '{key}' size: {len(val)}")
+          elif isinstance(response, list):
+              print(f"Greptile response is list with size: {len(response)}")
+          else:
+              print(f"Greptile response type: {type(response).__name__}")
+
+          # Normalize common shapes into workflow context format
+          items = []
+          for key in ("snippets", "results", "hits", "data"):
+              val = response.get(key)
+              if isinstance(val, list):
+                  items = val
+                  break
+          if not items and isinstance(response, list):
+              items = response
+
+          normalized = []
+          for idx, item in enumerate(items):
+              if not isinstance(item, dict):
+                  continue
+              path = item.get("path") or item.get("file_path") or item.get("file") or f"unknown-{idx}"
+              snippet = item.get("snippet") or item.get("content") or item.get("text") or ""
+              if not isinstance(snippet, str) or not snippet.strip():
+                  continue
+              normalized.append({
+                  "path": path,
+                  "file_score": int(item.get("file_score", item.get("score", 0))) if str(item.get("file_score", item.get("score", 0))).isdigit() else 0,
+                  "chunk_score": int(item.get("score", 0)) if str(item.get("score", 0)).isdigit() else 0,
+                  "start_line": int(item.get("start_line", 1)) if str(item.get("start_line", 1)).isdigit() else 1,
+                  "end_line": int(item.get("end_line", 1)) if str(item.get("end_line", 1)).isdigit() else 1,
+                  "snippet": snippet[: int(os.environ.get("MAX_FILE_CHARS", "12000"))]
+              })
+
+          if not normalized:
+              print("Greptile returned no usable snippets; falling back to local chunks")
+              set_output("used", "false")
+              set_output("source", "local_chunks")
+              raise SystemExit(0)
+
+          Path("out/context.json").write_text(json.dumps(normalized, ensure_ascii=True, indent=2), encoding="utf-8")
+          Path("out/context-source.txt").write_text("greptile", encoding="utf-8")
+          print(f"Greptile context ready with {len(normalized)} snippets")
+          set_output("used", "true")
+          set_output("source", "greptile")
+          PY
+        env:
+          GREPTILE_API_KEY: ${{ secrets.GREPTILE_API_KEY }}
+          GREPTILE_CONTEXT_URL: ${{ secrets.GREPTILE_CONTEXT_URL }}
+          ANALYSIS_ID: ${{ steps.payload.outputs.analysis_id }}
+          JIRA_SUMMARY: ${{ steps.payload.outputs.jira_summary }}
+          JIRA_DESCRIPTION: ${{ steps.payload.outputs.jira_description }}
+          JIRA_LABELS: ${{ steps.payload.outputs.jira_labels }}
+
       - name: Build repo context with targeted chunks
+        if: ${{ steps.greptile.outputs.used != 'true' }}
         run: |
           mkdir -p out
           python3 - <<'PY'
@@ -143,6 +293,7 @@ jobs:
                   })
 
           Path("out/context.json").write_text(json.dumps(context, ensure_ascii=True, indent=2), encoding="utf-8")
+          Path("out/context-source.txt").write_text("local_chunks", encoding="utf-8")
           PY
         env:
           JIRA_SUMMARY: ${{ steps.payload.outputs.jira_summary }}
