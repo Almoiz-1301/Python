@@ -3,7 +3,7 @@ run-name: spoke-${{ github.event.client_payload.analysis_id || inputs.analysis_i
 
 on:
   repository_dispatch:
-    types: [jira_feature_request]
+    types: [jira_feature_request_spoke]
   workflow_dispatch:
     inputs:
       analysis_id:
